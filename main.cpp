@@ -12,9 +12,12 @@
 #include <cstdio>
 #include <cwchar>
 #include <string>
+#include <vector>
 
 #include "audio.h"
 #include "game.h"
+#include "multiplayer.h"
+#include "net.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -23,6 +26,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 namespace {
 
@@ -40,6 +44,13 @@ constexpr int kDipPanelW = 236;
 constexpr int kDipPanelH = 656;
 constexpr int kDipInnerPad = 14;
 
+// Versus layout: two compact boards side by side.
+constexpr int kVersusDipW = 640;
+constexpr int kVersusDipH = 724;
+constexpr int kVersusCell = 28;
+constexpr int kVersusGap = 32;
+constexpr int kVersusBoardTop = 76;
+
 // ----------------------------------------------------------------- colors ---
 constexpr COLORREF kBg = RGB(9, 13, 22);
 constexpr COLORREF kCard = RGB(15, 22, 38);
@@ -53,7 +64,7 @@ constexpr COLORREF kGold = RGB(250, 204, 21);
 constexpr COLORREF kWhite = RGB(255, 255, 255);
 constexpr COLORREF kBlack = RGB(0, 0, 0);
 
-constexpr COLORREF kPieceColor[8] = {
+constexpr COLORREF kPieceColor[9] = {
     RGB(0, 0, 0),        // unused
     RGB(34, 211, 238),   // I cyan
     RGB(59, 130, 246),   // J blue
@@ -62,6 +73,7 @@ constexpr COLORREF kPieceColor[8] = {
     RGB(34, 197, 94),    // S green
     RGB(168, 85, 247),   // T purple
     RGB(239, 68, 68),    // Z red
+    RGB(100, 116, 139),  // garbage gray
 };
 
 COLORREF Mix(COLORREF a, COLORREF b, float t) {
@@ -97,10 +109,12 @@ struct Brushes {
     HBRUSH grid = nullptr;
     HBRUSH box = nullptr;
     HBRUSH accent = nullptr;
-    HBRUSH blockEdge[8]{};
-    HBRUSH ghostFill[8]{};
-    HBRUSH ghostEdge[8]{};
+    HBRUSH blockEdge[9]{};
+    HBRUSH ghostFill[9]{};
+    HBRUSH ghostEdge[9]{};
 };
+
+enum class Mode { Menu, Solo, Host, Join, Versus };
 
 struct App {
     HWND hwnd = nullptr;
@@ -128,8 +142,42 @@ struct App {
     bool hasLastTick = false;
     int savedBest = -1;
 
+    Mode mode = Mode::Menu;
+    int menuIndex = 0;
+    std::wstring notice;
+
+    // LAN lobby and versus match.
+    tetris::Net net;
+    tetris::RemotePlayer remote;
+    std::wstring joinIp = L"127.0.0.1";
+    std::wstring joinStatus;
+    bool joining = false;
+    bool netHost = false;
+    double startCountdown = 0.0;
+    bool matchOver = false;
+    bool matchDisconnected = false;
+    bool localWon = false;
+    double sendAcc = 0.0;
+
     int px(int dip) const { return static_cast<int>(std::lround(dip * scale)); }
 };
+
+std::wstring Widen(const std::string& text) {
+    std::wstring out;
+    out.reserve(text.size());
+    for (char ch : text) out.push_back(static_cast<wchar_t>(ch));
+    return out;
+}
+
+std::string Narrow(const std::wstring& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (wchar_t ch : text) out.push_back(static_cast<char>(ch));
+    return out;
+}
+
+void ApplyLayout(App& a, UINT dpi);
+void SetMode(App& a, Mode mode);
 
 RECT Rect(int l, int t, int r, int b) { return RECT{l, t, r, b}; }
 
@@ -225,7 +273,7 @@ void CreateBrushes(Brushes& b) {
     b.grid = CreateSolidBrush(kGrid);
     b.box = CreateSolidBrush(RGB(10, 16, 28));
     b.accent = CreateSolidBrush(kAccent);
-    for (int i = 1; i < 8; ++i) {
+    for (int i = 1; i < 9; ++i) {
         b.blockEdge[i] = CreateSolidBrush(Mix(kPieceColor[i], kBlack, 0.55f));
         b.ghostFill[i] = CreateSolidBrush(Mix(kBoardBg, kPieceColor[i], 0.12f));
         b.ghostEdge[i] = CreateSolidBrush(Mix(kBoardBg, kPieceColor[i], 0.55f));
@@ -238,7 +286,7 @@ void DestroyBrushes(Brushes& b) {
         if (*p) DeleteObject(*p);
         *p = nullptr;
     }
-    for (int i = 1; i < 8; ++i) {
+    for (int i = 1; i < 9; ++i) {
         DeleteObject(b.blockEdge[i]);
         DeleteObject(b.ghostFill[i]);
         DeleteObject(b.ghostEdge[i]);
@@ -295,7 +343,7 @@ RECT PanelRect(const App& a) {
 }
 
 void DrawBlock(HDC dc, const App& a, int x, int y, int size, int type) {
-    if (type < 1 || type > 7 || size < 4) return;
+    if (type < 1 || type > 8 || size < 4) return;
     const COLORREF color = kPieceColor[type];
     RECT outer = Rect(x, y, x + size, y + size);
     RECT inner = Rect(x + 1, y + 1, x + size - 1, y + size - 1);
@@ -304,7 +352,7 @@ void DrawBlock(HDC dc, const App& a, int x, int y, int size, int type) {
 }
 
 void DrawGhost(HDC dc, const App& a, int x, int y, int size, int type) {
-    if (type < 1 || type > 7) return;
+    if (type < 1 || type > 8) return;
     RECT r = Rect(x + 1, y + 1, x + size - 1, y + size - 1);
     FillRectC(dc, r, a.brushes.ghostFill[type]);
     FrameRectC(dc, r, a.brushes.ghostEdge[type]);
@@ -342,6 +390,383 @@ void DrawPieceBox(HDC dc, const App& a, const RECT& box, int type) {
     FillRectC(dc, box, a.brushes.box);
     FrameRectC(dc, box, a.brushes.border);
     DrawMiniPiece(dc, a, box, type);
+}
+
+// ------------------------------------------------------- versus helpers ----
+RECT VersusBoardRect(const App& a, int index) {
+    const int cell = a.px(kVersusCell);
+    const int boardW = cell * tetris::kCols;
+    const int boardH = cell * tetris::kRows;
+    const int gap = a.px(kVersusGap);
+    const int left = (a.bufW - (boardW * 2 + gap)) / 2;
+    const int x = left + index * (boardW + gap);
+    return Rect(x, a.px(kVersusBoardTop), x + boardW, a.px(kVersusBoardTop) + boardH);
+}
+
+bool RemoteCanPlace(const tetris::RemotePlayer& player, int type, int rot, int px,
+                    int py) {
+    if (type < 1 || type > 7) return false;
+    const uint16_t mask = tetris::Game::Mask(type, rot);
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (!(mask & (1u << (r * 4 + c)))) continue;
+            const int x = px + c;
+            const int y = py + r;
+            if (x < 0 || x >= tetris::kCols || y >= tetris::kRows) return false;
+            if (y >= 0 && player.board[y][x] != 0) return false;
+        }
+    }
+    return true;
+}
+
+int RemoteGhostY(const tetris::RemotePlayer& player) {
+    if (player.piece.type == 0) return player.piece.y;
+    int y = player.piece.y;
+    while (RemoteCanPlace(player, player.piece.type, player.piece.rot, player.piece.x,
+                          y + 1)) {
+        ++y;
+    }
+    return y;
+}
+
+void DrawPlayfieldCells(HDC dc, const App& a, const RECT& board, int cell,
+                        const tetris::ColorIndex (&cells)[tetris::kRows][tetris::kCols]) {
+    FillRectC(dc, board, a.brushes.board);
+    for (int c = 1; c < tetris::kCols; ++c) {
+        const int x = board.left + c * cell;
+        FillRectC(dc, Rect(x, board.top, x + 1, board.bottom), a.brushes.grid);
+    }
+    for (int r = 1; r < tetris::kRows; ++r) {
+        const int y = board.top + r * cell;
+        FillRectC(dc, Rect(board.left, y, board.right, y + 1), a.brushes.grid);
+    }
+    for (int r = 0; r < tetris::kRows; ++r) {
+        for (int c = 0; c < tetris::kCols; ++c) {
+            if (cells[r][c] == 0) continue;
+            DrawBlock(dc, a, board.left + c * cell, board.top + r * cell, cell,
+                      cells[r][c]);
+        }
+    }
+}
+
+void DrawActivePiece(HDC dc, const App& a, const RECT& board, int cell,
+                     const tetris::Piece& piece, int ghostY, bool showGhost) {
+    if (piece.type < 1 || piece.type > 7) return;
+    const uint16_t mask = tetris::Game::Mask(piece.type, piece.rot);
+
+    if (showGhost) {
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                if (!(mask & (1u << (r * 4 + c)))) continue;
+                const int y = ghostY + r;
+                const int x = piece.x + c;
+                if (y < 0 || y >= tetris::kRows || x < 0 || x >= tetris::kCols) continue;
+                DrawGhost(dc, a, board.left + x * cell, board.top + y * cell, cell,
+                          piece.type);
+            }
+        }
+    }
+
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (!(mask & (1u << (r * 4 + c)))) continue;
+            const int y = piece.y + r;
+            const int x = piece.x + c;
+            if (y < 0 || y >= tetris::kRows || x < 0 || x >= tetris::kCols) continue;
+            DrawBlock(dc, a, board.left + x * cell, board.top + y * cell, cell,
+                      piece.type);
+        }
+    }
+}
+
+void DrawVersusBoard(App& a, int index, const wchar_t* label, int score,
+                     const tetris::ColorIndex (&cells)[tetris::kRows][tetris::kCols],
+                     const tetris::Piece& piece, int ghostY, bool showGhost,
+                     bool active, bool paused, bool gameOver) {
+    HDC dc = a.memDC;
+    const int cell = a.px(kVersusCell);
+    const RECT board = VersusBoardRect(a, index);
+    const int pad = a.px(kDipCardPad);
+    RECT card = board;
+    card.left -= pad;
+    card.top -= pad;
+    card.right += pad;
+    card.bottom += pad;
+
+    FillRectC(dc, card, a.brushes.card);
+    FrameRectC(dc, card, a.brushes.border);
+    DrawPlayfieldCells(dc, a, board, cell, cells);
+    if (active) DrawActivePiece(dc, a, board, cell, piece, ghostY, showGhost);
+    FrameRectC(dc, board, a.brushes.border);
+
+    const int headerTop = board.top - a.px(52);
+    const RECT labelRect = Rect(board.left, headerTop, board.right, headerTop + a.px(26));
+    Text(dc, a.fonts.value, index == 0 ? kAccent : kText, labelRect, label,
+         DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    Text(dc, a.fonts.value, kText, labelRect, Number(score),
+         DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+
+    if (!active) {
+        AlphaFill(dc, board, 155, false, a.dimDC, a.whiteDC);
+        Text(dc, a.fonts.overlayText, kMuted, board, L"WAITING...",
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    } else if (gameOver) {
+        AlphaFill(dc, board, 170, false, a.dimDC, a.whiteDC);
+        Text(dc, a.fonts.overlayText, kText, board, L"GAME OVER",
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    } else if (paused) {
+        AlphaFill(dc, board, 140, false, a.dimDC, a.whiteDC);
+        Text(dc, a.fonts.overlayText, kText, board, L"PAUSED",
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+}
+
+void DrawMenu(App& a) {
+    HDC dc = a.memDC;
+    FillRectC(dc, Rect(0, 0, a.bufW, a.bufH), a.brushes.bg);
+
+    const int cx = a.bufW / 2;
+    Text(dc, a.fonts.overlayTitle, kText,
+         Rect(0, a.px(62), a.bufW, a.px(120)), L"TETRIS",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    const int accentW = a.px(58);
+    FillRectC(dc, Rect(cx - accentW / 2, a.px(126), cx + accentW / 2, a.px(130)),
+              a.brushes.accent);
+    Text(dc, a.fonts.label, kMuted,
+         Rect(0, a.px(140), a.bufW, a.px(160)), L"LAN VERSUS",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    static const wchar_t* const kOptions[3] = {L"SOLO", L"HOST LAN GAME",
+                                               L"JOIN LAN GAME"};
+    const int boxW = a.px(330);
+    const int boxH = a.px(54);
+    const int gap = a.px(16);
+    for (int i = 0; i < 3; ++i) {
+        const int y = a.px(210) + i * (boxH + gap);
+        const RECT r = Rect(cx - boxW / 2, y, cx + boxW / 2, y + boxH);
+        const bool selected = (i == a.menuIndex);
+        FillRectC(dc, r, a.brushes.card);
+        FrameRectC(dc, r, selected ? a.brushes.accent : a.brushes.border);
+        if (selected) {
+            FillRectC(dc, Rect(r.left, r.top, r.left + a.px(4), r.bottom),
+                      a.brushes.accent);
+        }
+        Text(dc, a.fonts.value, selected ? kAccent : kText, r, kOptions[i],
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+
+    if (!a.notice.empty()) {
+        Text(dc, a.fonts.label, kGold,
+             Rect(0, a.px(410), a.bufW, a.px(432)), a.notice,
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+
+    const auto addresses = tetris::Net::LocalAddresses();
+    Text(dc, a.fonts.label, kMuted,
+         Rect(0, a.px(454), a.bufW, a.px(474)),
+         L"HOST ADDRESS  \u2022  PORT 7777",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    if (addresses.empty()) {
+        Text(dc, a.fonts.value, kText,
+             Rect(0, a.px(478), a.bufW, a.px(500)), L"127.0.0.1",
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    } else {
+        const int count = std::min<int>(3, static_cast<int>(addresses.size()));
+        for (int i = 0; i < count; ++i) {
+            const int y = a.px(478 + i * 24);
+            Text(dc, a.fonts.value, kText, Rect(0, y, a.bufW, y + a.px(22)),
+                 Widen(addresses[i]) + L":7777",
+                 DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
+    }
+
+    Text(dc, a.fonts.tiny, kMuted,
+         Rect(0, a.px(640), a.bufW, a.px(660)),
+         L"\u2191 \u2193  SELECT      ENTER  CONFIRM      ESC  QUIT",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+
+void DrawHost(App& a) {
+    HDC dc = a.memDC;
+    FillRectC(dc, Rect(0, 0, a.bufW, a.bufH), a.brushes.bg);
+
+    Text(dc, a.fonts.overlayTitle, kText,
+         Rect(0, a.px(72), a.bufW, a.px(128)), L"HOST GAME",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    Text(dc, a.fonts.label, kMuted,
+         Rect(0, a.px(134), a.bufW, a.px(154)),
+         L"WAITING FOR A PLAYER ON YOUR LAN",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    const RECT panel = Rect(a.bufW / 2 - a.px(230), a.px(200),
+                            a.bufW / 2 + a.px(230), a.px(470));
+    FillRectC(dc, panel, a.brushes.card);
+    FrameRectC(dc, panel, a.brushes.border);
+
+    Text(dc, a.fonts.label, kMuted,
+         Rect(panel.left, panel.top + a.px(26), panel.right, panel.top + a.px(46)),
+         L"SHARE THIS ADDRESS WITH THE OTHER PLAYER",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    const auto addresses = tetris::Net::LocalAddresses();
+    int y = panel.top + a.px(70);
+    if (addresses.empty()) {
+        Text(dc, a.fonts.value, kText, Rect(panel.left, y, panel.right, y + a.px(28)),
+             L"127.0.0.1:7777  (same PC only)",
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    } else {
+        const int count = std::min<int>(4, static_cast<int>(addresses.size()));
+        for (int i = 0; i < count; ++i) {
+            Text(dc, a.fonts.value, kText,
+                 Rect(panel.left, y, panel.right, y + a.px(28)),
+                 Widen(addresses[i]) + L":7777",
+                 DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            y += a.px(32);
+        }
+    }
+
+    Text(dc, a.fonts.label, kMuted,
+         Rect(panel.left, panel.bottom - a.px(62), panel.right,
+              panel.bottom - a.px(42)),
+         L"LISTENING ON PORT 7777", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    Text(dc, a.fonts.tiny, kMuted,
+         Rect(0, a.px(620), a.bufW, a.px(642)), L"ESC  CANCEL",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+
+void DrawJoin(App& a) {
+    HDC dc = a.memDC;
+    FillRectC(dc, Rect(0, 0, a.bufW, a.bufH), a.brushes.bg);
+
+    Text(dc, a.fonts.overlayTitle, kText,
+         Rect(0, a.px(78), a.bufW, a.px(134)), L"JOIN GAME",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    Text(dc, a.fonts.label, kMuted,
+         Rect(0, a.px(142), a.bufW, a.px(162)),
+         L"ENTER THE HOST'S IP ADDRESS", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    const RECT field = Rect(a.bufW / 2 - a.px(180), a.px(220),
+                            a.bufW / 2 + a.px(180), a.px(276));
+    FillRectC(dc, field, a.brushes.card);
+    FrameRectC(dc, field, a.joining ? a.brushes.accent : a.brushes.border);
+    const bool cursor = (GetTickCount64() / 500) % 2 == 0;
+    const std::wstring shown = a.joinIp + (cursor ? L"_" : L" ");
+    Text(dc, a.fonts.value, kText, field, shown,
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    std::wstring status;
+    COLORREF statusColor = kMuted;
+    if (a.joining) {
+        status = L"CONNECTING...";
+        statusColor = kAccent;
+    } else if (!a.joinStatus.empty()) {
+        status = a.joinStatus;
+        statusColor = kGold;
+    } else {
+        status = L"PORT 7777";
+    }
+    Text(dc, a.fonts.label, statusColor,
+         Rect(0, a.px(298), a.bufW, a.px(320)), status,
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    Text(dc, a.fonts.tiny, kMuted,
+         Rect(0, a.px(612), a.bufW, a.px(634)),
+         L"TYPE DIGITS AND DOTS      ENTER  CONNECT      ESC  CANCEL",
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+
+void DrawVersus(App& a) {
+    HDC dc = a.memDC;
+    FillRectC(dc, Rect(0, 0, a.bufW, a.bufH), a.brushes.bg);
+
+    const tetris::Game& g = a.game;
+    const RECT left = VersusBoardRect(a, 0);
+    const RECT right = VersusBoardRect(a, 1);
+
+    const bool localGhost = g.state() == tetris::Game::State::Playing;
+    DrawVersusBoard(a, 0, L"YOU", g.score(), g.board(), g.piece(),
+                    localGhost ? g.GhostY() : g.piece().y, localGhost, true,
+                    g.state() == tetris::Game::State::Paused,
+                    g.state() == tetris::Game::State::GameOver);
+
+    const bool remoteActive = a.remote.active;
+    const bool remotePlaying =
+        remoteActive && !a.remote.paused && !a.remote.gameOver;
+    DrawVersusBoard(a, 1, remoteActive ? L"OPPONENT" : L"WAITING",
+                    a.remote.score, a.remote.board, a.remote.piece,
+                    remotePlaying ? RemoteGhostY(a.remote) : a.remote.piece.y,
+                    remotePlaying, remoteActive, a.remote.paused,
+                    a.remote.gameOver);
+
+    // Compact stats under each playfield.
+    const auto drawStats = [&](const RECT& board, int level, int lines) {
+        const int y = board.bottom + a.px(12);
+        Text(dc, a.fonts.label, kMuted,
+             Rect(board.left, y, board.left + a.px(80), y + a.px(20)), L"LEVEL",
+             DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        Text(dc, a.fonts.value, kText,
+             Rect(board.left + a.px(64), y, board.left + a.px(150), y + a.px(20)),
+             std::to_wstring(level), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        Text(dc, a.fonts.label, kMuted,
+             Rect(board.left + a.px(150), y, board.left + a.px(218), y + a.px(20)),
+             L"LINES", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        Text(dc, a.fonts.value, kText,
+             Rect(board.left + a.px(212), y, board.right, y + a.px(20)),
+             std::to_wstring(lines), DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    };
+    drawStats(left, g.level(), g.lines());
+    drawStats(right, a.remote.level, a.remote.lines);
+
+    // Divider and status line in the gap between the boards.
+    const int midX = (left.right + right.left) / 2;
+    const int midY = (left.top + left.bottom) / 2;
+    FillRectC(dc, Rect(midX, left.top, midX + 1, left.bottom), a.brushes.border);
+    Text(dc, a.fonts.label, kAccent, Rect(midX - a.px(24), midY - a.px(14),
+                                          midX + a.px(24), midY + a.px(14)),
+         L"VS", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    const std::wstring conn =
+        a.net.Connected() ? L"LAN CONNECTED" : L"DISCONNECTED";
+    Text(dc, a.fonts.tiny, a.net.Connected() ? kMuted : kGold,
+         Rect(0, a.bufH - a.px(30), a.bufW, a.bufH - a.px(10)), conn,
+         DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    if (!a.matchOver && a.startCountdown > 0.0) {
+        const int seconds = static_cast<int>(std::ceil(a.startCountdown / 1000.0));
+        const int cx = (left.left + right.right) / 2;
+        const int cy = (left.top + left.bottom) / 2;
+        AlphaFill(dc, Rect(cx - a.px(120), cy - a.px(64), cx + a.px(120),
+                           cy + a.px(64)),
+                  120, false, a.dimDC, a.whiteDC);
+        Text(dc, a.fonts.overlayText, kText,
+             Rect(cx - a.px(120), cy - a.px(56), cx + a.px(120), cy - a.px(20)),
+             L"GET READY", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        Text(dc, a.fonts.overlayTitle, kAccent,
+             Rect(cx - a.px(120), cy - a.px(14), cx + a.px(120), cy + a.px(54)),
+             std::to_wstring(seconds), DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+
+    if (a.matchOver) {
+        AlphaFill(dc, Rect(0, 0, a.bufW, a.bufH), 200, false, a.dimDC, a.whiteDC);
+        const int cy = a.bufH / 2;
+        const wchar_t* title = a.matchDisconnected
+                                   ? L"CONNECTION LOST"
+                                   : (a.localWon ? L"YOU WIN" : L"YOU LOSE");
+        Text(dc, a.fonts.overlayTitle, a.matchDisconnected ? kGold : kText,
+             Rect(0, cy - a.px(100), a.bufW, cy - a.px(36)), title,
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        Text(dc, a.fonts.value, kMuted,
+             Rect(0, cy - a.px(20), a.bufW, cy + a.px(10)),
+             L"YOU  " + Number(g.score()) + L"        OPPONENT  " +
+                 Number(a.remote.score),
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        const wchar_t* hint =
+            a.matchDisconnected ? L"ESC  BACK TO MENU"
+                                : L"R  REMATCH        ESC  MENU";
+        Text(dc, a.fonts.overlayText, kMuted,
+             Rect(0, cy + a.px(48), a.bufW, cy + a.px(78)), hint,
+             DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
 }
 
 void DrawBoard(App& a) {
@@ -535,6 +960,23 @@ void DrawGameOverOverlay(App& a) {
 void RenderFrame(App& a) {
     using tetris::Game;
     if (!a.memDC) return;
+    switch (a.mode) {
+        case Mode::Menu:
+            DrawMenu(a);
+            return;
+        case Mode::Host:
+            DrawHost(a);
+            return;
+        case Mode::Join:
+            DrawJoin(a);
+            return;
+        case Mode::Versus:
+            DrawVersus(a);
+            return;
+        case Mode::Solo:
+            break;
+    }
+
     HDC dc = a.memDC;
     const RECT client = Rect(0, 0, a.bufW, a.bufH);
     FillRectC(dc, client, a.brushes.bg);
@@ -648,6 +1090,40 @@ void ApplyDarkTitlebar(HWND hwnd) {
     DwmSetWindowAttribute(hwnd, 33, &round, sizeof(round));
 }
 
+void SetMode(App& a, Mode mode) {
+    const bool resize = (a.mode == Mode::Versus) != (mode == Mode::Versus);
+    a.mode = mode;
+    a.notice.clear();
+    a.hasLastTick = false;
+    if (mode == Mode::Menu) {
+        a.music.Start();
+        a.lastState = a.game.state();
+    }
+    if (resize) {
+        const UINT dpi = GetDpiForWindow(a.hwnd);
+        ApplyLayout(a, dpi != 0 ? dpi : a.dpi);
+    }
+    InvalidateRect(a.hwnd, nullptr, FALSE);
+}
+
+void StartVersusMatch(App& a, bool host) {
+    a.netHost = host;
+    a.game.Reset();
+    a.game.SetBest(0);
+    a.remote.Reset();
+    a.remote.active = false;
+    a.matchOver = false;
+    a.matchDisconnected = false;
+    a.localWon = false;
+    a.startCountdown = 3000.0;
+    a.sendAcc = 0.0;
+    a.lastState = a.game.state();
+    if (a.music.Available()) a.music.Start();
+    a.net.SendLine("HELLO");
+    SetMode(a, Mode::Versus);
+    SetWindowTextW(a.hwnd, host ? L"Tetris - LAN (Host)" : L"Tetris - LAN (Guest)");
+}
+
 void SyncMusic(App& a) {
     using State = tetris::Game::State;
     const State state = a.game.state();
@@ -675,6 +1151,128 @@ void SyncMusic(App& a) {
     a.lastState = state;
 }
 
+void EnterMenu(App& a) {
+    if (a.net.Listening() || a.net.Connected()) a.net.SendLine(tetris::EncodeBye());
+    a.net.Close();
+    a.joining = false;
+    a.joinStatus.clear();
+    a.matchOver = false;
+    a.matchDisconnected = false;
+    a.localWon = false;
+    a.startCountdown = 0.0;
+    SetMode(a, Mode::Menu);
+    SetWindowTextW(a.hwnd, L"Tetris");
+}
+
+void ResetVersus(App& a) {
+    a.game.Reset();
+    a.game.SetBest(0);
+    a.remote.Reset();
+    a.matchOver = false;
+    a.matchDisconnected = false;
+    a.localWon = false;
+    a.startCountdown = 3000.0;
+    a.sendAcc = 0.0;
+    a.lastState = a.game.state();
+    if (a.music.Available()) a.music.Start();
+}
+
+void UpdateSolo(App& a, double dt) {
+    a.game.Update(dt);
+    SyncMusic(a);
+    if (a.game.state() == tetris::Game::State::GameOver &&
+        a.game.best() != a.savedBest) {
+        a.savedBest = a.game.best();
+        SaveBest(a.savedBest);
+    }
+}
+
+void UpdateLobby(App& a) {
+    a.net.Poll();
+    if (a.mode == Mode::Host) {
+        if (a.net.Connected()) {
+            StartVersusMatch(a, true);
+        } else if (a.net.Failed()) {
+            a.notice = Widen(a.net.Error());
+            a.net.Close();
+            SetMode(a, Mode::Menu);
+            SetWindowTextW(a.hwnd, L"Tetris");
+        }
+    } else if (a.mode == Mode::Join) {
+        if (a.net.Connected()) {
+            StartVersusMatch(a, false);
+        } else if (a.joining && a.net.Failed()) {
+            a.joining = false;
+            a.joinStatus = Widen(a.net.Error());
+            a.net.Close();
+        }
+    }
+}
+
+void UpdateVersus(App& a, double dt) {
+    a.net.Poll();
+    if (!a.net.Connected() && !a.matchOver) {
+        a.matchOver = true;
+        a.matchDisconnected = true;
+        a.localWon = false;
+    }
+
+    std::string line;
+    while (a.net.ReceiveLine(line)) {
+        tetris::Message message;
+        if (!tetris::ParseMessage(line, message)) continue;
+
+        switch (message.type) {
+            case tetris::MessageType::State:
+                a.remote = message.state;
+                if (message.state.gameOver) {
+                    if (a.game.state() == tetris::Game::State::GameOver) {
+                        a.localWon = a.game.score() > a.remote.score;
+                    } else if (!a.matchOver) {
+                        a.localWon = true;
+                    }
+                    a.matchOver = true;
+                }
+                break;
+            case tetris::MessageType::Garbage:
+                if (!a.matchOver) a.game.QueueGarbage(message.value);
+                break;
+            case tetris::MessageType::Restart:
+                if (a.matchOver) ResetVersus(a);
+                break;
+            case tetris::MessageType::Bye:
+                a.matchOver = true;
+                a.matchDisconnected = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (!a.matchOver) {
+        if (a.startCountdown > 0.0) {
+            a.startCountdown = std::max(0.0, a.startCountdown - dt);
+        } else {
+            a.game.Update(dt);
+            if (a.game.state() == tetris::Game::State::GameOver) {
+                a.matchOver = true;
+                a.localWon = false;
+            }
+        }
+    }
+
+    a.sendAcc += dt;
+    if (a.sendAcc >= 33.0 && a.net.Connected()) {
+        a.sendAcc = 0.0;
+        a.net.SendLine(tetris::EncodeState(a.game));
+    }
+    const int garbage = a.game.ConsumeOutgoingGarbage();
+    if (garbage > 0 && a.net.Connected()) {
+        a.net.SendLine(tetris::EncodeGarbage(garbage));
+    }
+    SyncMusic(a);
+}
+
 void Tick(App& a) {
     a.music.Pump();
     if (IsIconic(a.hwnd)) return;
@@ -690,17 +1288,144 @@ void Tick(App& a) {
     a.hasLastTick = true;
     dt = std::clamp(dt, 0.0, 100.0);
 
-    a.game.Update(dt);
-    SyncMusic(a);
-    if (a.game.state() == tetris::Game::State::GameOver && a.game.best() != a.savedBest) {
-        a.savedBest = a.game.best();
-        SaveBest(a.savedBest);
+    switch (a.mode) {
+        case Mode::Menu:
+            break;
+        case Mode::Solo:
+            UpdateSolo(a, dt);
+            break;
+        case Mode::Host:
+        case Mode::Join:
+            UpdateLobby(a);
+            break;
+        case Mode::Versus:
+            UpdateVersus(a, dt);
+            break;
     }
     InvalidateRect(a.hwnd, nullptr, FALSE);
 }
 
+void StartMenuChoice(App& a) {
+    a.notice.clear();
+    switch (a.menuIndex) {
+        case 0:
+            a.net.Close();
+            a.game.Reset();
+            a.game.SetBest(a.savedBest);
+            a.music.Start();
+            a.lastState = a.game.state();
+            SetMode(a, Mode::Solo);
+            SetWindowTextW(a.hwnd, L"Tetris");
+            break;
+        case 1:
+            a.net.Close();
+            if (!a.net.Host(tetris::kDefaultPort)) {
+                a.notice = Widen(a.net.Error());
+            } else {
+                SetMode(a, Mode::Host);
+                SetWindowTextW(a.hwnd, L"Tetris - Hosting (LAN)");
+            }
+            break;
+        case 2:
+        default:
+            a.net.Close();
+            a.joining = false;
+            a.joinStatus.clear();
+            SetMode(a, Mode::Join);
+            SetWindowTextW(a.hwnd, L"Tetris - Join (LAN)");
+            break;
+    }
+}
+
+void BeginJoin(App& a) {
+    a.net.Close();
+    a.joinStatus.clear();
+    a.joining = a.net.Connect(Narrow(a.joinIp), tetris::kDefaultPort);
+    if (!a.joining) a.joinStatus = Widen(a.net.Error());
+}
+
 void OnKeyDown(App& a, WPARAM vk, bool repeat) {
     using A = tetris::Game::Action;
+
+    if (a.mode == Mode::Menu) {
+        if (repeat) return;
+        switch (vk) {
+            case VK_UP:
+            case 'W':
+                a.menuIndex = (a.menuIndex + 2) % 3;
+                a.notice.clear();
+                break;
+            case VK_DOWN:
+            case 'S':
+                a.menuIndex = (a.menuIndex + 1) % 3;
+                a.notice.clear();
+                break;
+            case '1':
+                a.menuIndex = 0;
+                break;
+            case '2':
+                a.menuIndex = 1;
+                break;
+            case '3':
+                a.menuIndex = 2;
+                break;
+            case 'M':
+                a.music.ToggleMute();
+                break;
+            case VK_RETURN:
+                StartMenuChoice(a);
+                break;
+            case VK_ESCAPE:
+                DestroyWindow(a.hwnd);
+                break;
+            default:
+                break;
+        }
+        return;
+    }
+
+    if (a.mode == Mode::Host) {
+        if (!repeat && vk == VK_ESCAPE) EnterMenu(a);
+        if (!repeat && vk == 'M') a.music.ToggleMute();
+        return;
+    }
+
+    if (a.mode == Mode::Join) {
+        if (repeat) return;
+        switch (vk) {
+            case VK_ESCAPE:
+                a.net.Close();
+                a.joining = false;
+                a.joinStatus.clear();
+                EnterMenu(a);
+                break;
+            case VK_BACK:
+                if (!a.joinIp.empty()) a.joinIp.pop_back();
+                a.joinStatus.clear();
+                break;
+            case VK_RETURN:
+                if (!a.joining) BeginJoin(a);
+                break;
+            case 'M':
+                a.music.ToggleMute();
+                break;
+            default:
+                break;
+        }
+        return;
+    }
+
+    if (a.mode == Mode::Versus && a.matchOver) {
+        if (repeat) return;
+        if ((vk == 'R' || vk == VK_RETURN) && a.net.Connected()) {
+            a.net.SendLine(tetris::EncodeRestart());
+            ResetVersus(a);
+        } else if (vk == VK_ESCAPE) {
+            EnterMenu(a);
+        }
+        return;
+    }
+
     switch (vk) {
         case VK_LEFT:
             if (!repeat) a.game.Handle(A::LeftDown);
@@ -732,14 +1457,14 @@ void OnKeyDown(App& a, WPARAM vk, bool repeat) {
             if (!repeat) a.game.Handle(A::TogglePause);
             break;
         case 'R':
-            if (!repeat) {
+            if (!repeat && a.mode == Mode::Solo) {
                 a.game.Handle(A::Restart);
                 a.music.Start();
                 a.lastState = a.game.state();
             }
             break;
         case VK_RETURN:
-            if (!repeat) {
+            if (!repeat && a.mode == Mode::Solo) {
                 if (a.game.state() == tetris::Game::State::GameOver) {
                     a.game.Handle(A::Restart);
                     a.music.Start();
@@ -756,6 +1481,7 @@ void OnKeyDown(App& a, WPARAM vk, bool repeat) {
 }
 
 void OnKeyUp(App& a, WPARAM vk) {
+    if (a.mode != Mode::Solo && a.mode != Mode::Versus) return;
     using A = tetris::Game::Action;
     switch (vk) {
         case VK_LEFT: a.game.Handle(A::LeftUp); break;
@@ -765,15 +1491,25 @@ void OnKeyUp(App& a, WPARAM vk) {
     }
 }
 
-float ComputeScale(UINT dpi, const RECT& work) {
+void ClientDipSize(Mode mode, int& width, int& height) {
+    if (mode == Mode::Versus) {
+        width = kVersusDipW;
+        height = kVersusDipH;
+    } else {
+        width = kDipClientW;
+        height = kDipClientH;
+    }
+}
+
+float ComputeScale(UINT dpi, const RECT& work, int dipW, int dipH) {
     const float native = static_cast<float>(dpi) / 96.0f;
     const float chromeH = 44.0f * native;  // title bar + borders, roughly
     const float availW = static_cast<float>(work.right - work.left) - 24.0f;
     const float availH =
         static_cast<float>(work.bottom - work.top) - chromeH - 16.0f;
     float s = native;
-    s = std::min(s, availW / static_cast<float>(kDipClientW));
-    s = std::min(s, availH / static_cast<float>(kDipClientH));
+    s = std::min(s, availW / static_cast<float>(dipW));
+    s = std::min(s, availH / static_cast<float>(dipH));
     return std::clamp(s, 0.5f, native);
 }
 
@@ -790,12 +1526,16 @@ void ApplyLayout(App& a, UINT dpi) {
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     }
 
-    a.scale = ComputeScale(dpi, work);
+    int dipW = kDipClientW;
+    int dipH = kDipClientH;
+    ClientDipSize(a.mode, dipW, dipH);
+
+    a.scale = ComputeScale(dpi, work, dipW, dipH);
     CreateFonts(a);
 
     const DWORD style = static_cast<DWORD>(GetWindowLongW(a.hwnd, GWL_STYLE));
     const DWORD exStyle = static_cast<DWORD>(GetWindowLongW(a.hwnd, GWL_EXSTYLE));
-    RECT wr = Rect(0, 0, a.px(kDipClientW), a.px(kDipClientH));
+    RECT wr = Rect(0, 0, a.px(dipW), a.px(dipH));
     AdjustWindowRectExForDpi(&wr, style, FALSE, exStyle, dpi);
     const int winW = wr.right - wr.left;
     const int winH = wr.bottom - wr.top;
@@ -845,6 +1585,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER:
             if (wParam == kTimerId) Tick(*a);
             return 0;
+        case WM_CHAR:
+            if (a->mode == Mode::Join) {
+                const wchar_t ch = static_cast<wchar_t>(wParam);
+                if ((ch >= L'0' && ch <= L'9') || ch == L'.') {
+                    if (a->joinIp.size() < 15) {
+                        a->joinIp.push_back(ch);
+                        a->joinStatus.clear();
+                    }
+                }
+                return 0;
+            }
+            break;
         case WM_KEYDOWN:
             OnKeyDown(*a, wParam, (lParam & (1LL << 30)) != 0);
             return 0;
@@ -852,8 +1604,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             OnKeyUp(*a, wParam);
             return 0;
         case WM_KILLFOCUS:
-            a->game.Pause();
-            SyncMusic(*a);
+            // Solo play pauses automatically; a LAN match should keep running
+            // so the other player is not blocked by a lost focus.
+            if (a->mode == Mode::Solo) {
+                a->game.Pause();
+                SyncMusic(*a);
+            }
             a->hasLastTick = false;
             return 0;
         case WM_SETFOCUS:
@@ -874,6 +1630,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 a->savedBest = a->game.best();
                 SaveBest(a->savedBest);
             }
+            if (a->net.Connected()) a->net.SendLine(tetris::EncodeBye());
+            a->net.Close();
             a->music.Shutdown();
             PostQuitMessage(0);
             return 0;
@@ -900,7 +1658,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     RECT work{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    app.scale = ComputeScale(app.dpi, work);
+    int dipW = kDipClientW;
+    int dipH = kDipClientH;
+    ClientDipSize(app.mode, dipW, dipH);
+    app.scale = ComputeScale(app.dpi, work, dipW, dipH);
 
     InitPaintResources(app);
 

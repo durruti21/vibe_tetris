@@ -16,6 +16,8 @@ inline constexpr int kMaxLevel = 20;
 
 // 1 = I, 2 = J, 3 = L, 4 = O, 5 = S, 6 = T, 7 = Z (0 = none)
 using ColorIndex = uint8_t;
+// Garbage rows use their own color so they are easy to recognize.
+inline constexpr ColorIndex kGarbageColor = 8;
 
 struct Piece {
     int type = 0;
@@ -40,6 +42,11 @@ public:
     void Pause();
     void TogglePause();
     void SetBest(int best);
+
+    // Versus-mode helpers. Incoming garbage is added when the next piece
+    // spawns; outgoing garbage accumulates when lines are cleared.
+    void QueueGarbage(int lines);
+    int ConsumeOutgoingGarbage();
 
     // Read-only accessors used by the renderer.
     State state() const { return state_; }
@@ -75,6 +82,7 @@ private:
     void FinishClear();
     void GameOver();
     void AppendBag();
+    void AddGarbageRows(int lines);
     void SetMessage(const std::wstring& text);
     void UpdateHorizontal(double dt);
     double GravityInterval() const;
@@ -110,6 +118,9 @@ private:
 
     std::wstring message_;
     double messageTimer_ = 0.0;
+
+    int pendingGarbage_ = 0;
+    int outgoingGarbage_ = 0;
 };
 
 }  // namespace tetris

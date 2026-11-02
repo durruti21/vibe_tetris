@@ -147,9 +147,35 @@ void Game::Reset() {
     dasAcc_ = arrAcc_ = 0.0;
     message_.clear();
     messageTimer_ = 0.0;
+    pendingGarbage_ = 0;
+    outgoingGarbage_ = 0;
     state_ = State::Playing;
     while (static_cast<int>(queue_.size()) < 7) AppendBag();
     SpawnFromQueue();
+}
+
+void Game::QueueGarbage(int lines) {
+    if (lines <= 0) return;
+    pendingGarbage_ = std::min(kRows, pendingGarbage_ + lines);
+}
+
+int Game::ConsumeOutgoingGarbage() {
+    const int value = outgoingGarbage_;
+    outgoingGarbage_ = 0;
+    return value;
+}
+
+void Game::AddGarbageRows(int lines) {
+    if (lines <= 0) return;
+    lines = std::min(lines, kRows);
+
+    for (int r = 0; r < kRows - lines; ++r) {
+        std::memcpy(board_[r], board_[r + lines], sizeof(board_[0]));
+    }
+    for (int r = kRows - lines; r < kRows; ++r) {
+        std::memset(board_[r], static_cast<int>(kGarbageColor), sizeof(board_[0]));
+        board_[r][rng_() % kCols] = 0;  // one hole makes the row survivable
+    }
 }
 
 void Game::SetBest(int best) {
@@ -427,6 +453,8 @@ void Game::LockPiece() {
 
     if (full.empty()) {
         combo_ = -1;
+        AddGarbageRows(pendingGarbage_);
+        pendingGarbage_ = 0;
         SpawnFromQueue();
         return;
     }
@@ -439,6 +467,12 @@ void Game::LockPiece() {
     level_ = std::min(kMaxLevel, 1 + lines_ / 10);
     combo_ = combo_ + 1;  // starts at -1, so the first clear is combo 0
     if (combo_ > 0) score_ += 50 * combo_ * level_;
+
+    // Versus attack: singles send nothing, doubles send one row, triples two
+    // and a tetris four. Consecutive combos add one more row.
+    int attack = (n == 2) ? 1 : (n == 3) ? 2 : (n >= 4) ? 4 : 0;
+    if (combo_ > 0 && attack > 0) ++attack;
+    outgoingGarbage_ += attack;
 
     clearingRows_ = std::move(full);
     clearTimer_ = clearDuration_;
@@ -471,6 +505,8 @@ void Game::FinishClear() {
 
     clearingRows_.clear();
     clearTimer_ = 0.0;
+    AddGarbageRows(pendingGarbage_);
+    pendingGarbage_ = 0;
     state_ = State::Playing;
     SpawnFromQueue();
 }

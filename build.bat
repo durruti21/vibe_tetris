@@ -25,8 +25,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-cl /nologo /W4 /EHsc /std:c++17 /O2 /DUNICODE /D_UNICODE audio.cpp game.cpp main.cpp ^
-   /link /SUBSYSTEM:WINDOWS /OUT:tetris.exe winmm.lib
+cl /nologo /W4 /EHsc /std:c++17 /O2 /DUNICODE /D_UNICODE audio.cpp game.cpp ^
+   multiplayer.cpp net.cpp main.cpp ^
+   /link /SUBSYSTEM:WINDOWS /OUT:tetris.exe winmm.lib ws2_32.lib
 if errorlevel 1 (
     echo.
     echo Build failed.
